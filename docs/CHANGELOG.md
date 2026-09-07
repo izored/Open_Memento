@@ -7,6 +7,24 @@ All notable changes to OpenMemo are documented here.
 
 <!-- Add entries here as work lands: ### Added / ### Changed / ### Fixed -->
 
+### Added
+
+- ⚡ **A Check now button for phone capture.** Under Settings, in the phone capture card, below the interval. It asks Telegram for waiting shares straight away instead of sitting out the wait, and it tells you what came back: how many shares it saved, that there was nothing waiting, or what went wrong reaching Telegram. It waits for the answer rather than firing and shrugging, because a button that goes quiet is indistinguishable from a broken one, and the moment you press it is the moment you already suspect something is wrong.
+
+  It also says why nothing happened when nothing can: no token stored, capture switched off, or the relay not running on this machine.
+
+  Turning capture on, or pasting a token, now starts polling immediately too. It used to wait up to thirty seconds first.
+
+### Fixed
+
+- 🔒 **Changing a setting no longer wipes your Telegram bot out of the page.** Changing how often openMemo checks Telegram made the bot token disappear from the card and greyed the capture switch off, as if the bot had been forgotten. It never was. The token was on disk the whole time and capture never stopped; reloading the page brought it all back.
+
+  The page asks the server to save a setting and stores whatever comes back as the new state of everything. The reply was missing the handful of facts the server works out rather than stores, and "a bot token is stored" is one of them. So the card read the silence as a no.
+
+- 🔐 **Saving a setting no longer sends your secrets back to the page.** The same reply carried the raw settings file, which holds the Telegram bot token, the Telegram account capture is locked to, the hidden section passcode, the music relay session and the Mesh root key. Reading your settings has always stripped every one of those. Saving one handed them all over, so every toggle on the Settings page put the bot token in a response.
+
+  Nothing left this machine, and no other program can reach that reply. It should never have been in it.
+
 ---
 ## [3.19.1] - 2026-09-06
 

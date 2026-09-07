@@ -828,6 +828,8 @@ function TelegramRelayRows({ profile, save }: { profile: AppSettings | null; sav
   const [tokenPresent, setTokenPresent] = useState<boolean | null>(null);
   const [tokenError, setTokenError] = useState('');
   const [status, setStatus] = useState<TelegramRelayStatus | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [checkResult, setCheckResult] = useState<string | null>(null);
 
   useEffect(() => {
     settingsApi.telegramStatus().then(setStatus).catch(() => setStatus(null));
@@ -850,6 +852,47 @@ function TelegramRelayRows({ profile, save }: { profile: AppSettings | null; sav
   const clearToken = async () => {
     const r = await settingsApi.setTelegramToken('');
     setTokenPresent(r.telegram_token_present);
+  };
+
+  // Ask Telegram right now rather than waiting out the interval. Waits for the
+  // poll to actually finish and says what it found: a button that fires and
+  // shrugs is indistinguishable from a broken one, which is the whole reason
+  // people reach for it — they are already unsure the relay is working.
+  const checkNow = async () => {
+    if (checking) return;
+    setChecking(true);
+    setCheckResult(null);
+    try {
+      const r = await settingsApi.telegramPollNow('manual', 20);
+      if (!r.kicked) {
+        setCheckResult(
+          r.skipped_reason === 'throttled'
+            ? 'Just checked a moment ago. Try again in a few seconds.'
+            : r.skipped_reason === 'no_token'
+              ? 'No bot token stored yet.'
+              : r.skipped_reason === 'disabled'
+                ? 'Turn Telegram capture on first.'
+                : 'The relay is not running on this machine. See the status above.',
+        );
+      } else if (!r.completed) {
+        setCheckResult('Still checking. Give it a moment, then reload.');
+      } else if (r.last_error) {
+        setCheckResult(`Could not reach Telegram: ${r.last_error}`);
+      } else {
+        setCheckResult(
+          r.saved > 0
+            ? `Saved ${r.saved} share${r.saved === 1 ? '' : 's'}.`
+            : 'Checked. Nothing waiting.',
+        );
+      }
+      // Refresh the card's own status line off the same poll, so "last answered"
+      // and the stale banner reflect the check that just ran.
+      settingsApi.telegramStatus().then(setStatus).catch(() => {});
+    } catch (e) {
+      setCheckResult(e instanceof Error ? e.message : 'Check failed');
+    } finally {
+      setChecking(false);
+    }
   };
 
   // Show when Telegram last ANSWERED, never when we last tried. The card used
@@ -981,6 +1024,22 @@ function TelegramRelayRows({ profile, save }: { profile: AppSettings | null; sav
           onChange={(v) => save({ telegram_poll_minutes: Number(v) })}
           width={130}
         />
+      </div>
+      <div className="om-setting-row" style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 8 }}>
+        <div className="om-setting-row-text">
+          <p>Check now</p>
+          <span className="mono">
+            {checkResult
+              ?? 'Ask Telegram for waiting shares straight away, without waiting out the interval above.'}
+          </span>
+        </div>
+        <button
+          className="om-btn-secondary"
+          onClick={checkNow}
+          disabled={checking || !present || !enabled}
+        >
+          {checking ? 'Checking…' : 'Check now'}
+        </button>
       </div>
     </>
   );
@@ -1660,7 +1719,13 @@ export function SettingsPage() {
   const saveProfile = async (patch: Partial<AppSettings>) => {
     try {
       const next = await settingsApi.update(patch);
-      setProfile(next);
+      // Merged, not replaced. The PUT reply once omitted every computed key
+      // (`telegram_token_present`, `yt_cookies_present`, `install_kind`, …) and
+      // this line stored it verbatim, so changing the Telegram poll interval
+      // wiped the bot token out of the card and greyed the relay toggle off on
+      // perfectly intact state. The backend returns the full shape now; keeping
+      // the merge means the next endpoint to answer short cannot blank the page.
+      setProfile((prev) => (prev ? { ...prev, ...next } : next));
       queryClient.invalidateQueries({ queryKey: ['settings'] });
       setProfileSaved(true);
       setTimeout(() => setProfileSaved(false), 1500);

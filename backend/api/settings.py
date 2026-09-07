@@ -140,7 +140,7 @@ async def write_settings(patch: SettingsPatch):
     data = patch.model_dump(exclude_none=True)
     if "auto_file_rules" in data:
         data["auto_file_rules"] = _clean_auto_file_rules(data["auto_file_rules"])
-    result = update_settings(data)
+    update_settings(data)
     # Mesh's triggers are physical, so flipping the flag has to change the
     # database, not just a JSON field. Doing it here keeps "enabled" meaning one
     # thing (ADR-024 §0) instead of drifting from what is actually installed.
@@ -155,7 +155,23 @@ async def write_settings(patch: SettingsPatch):
         from backend.core.mesh.sync_state import rebind_listener
 
         await rebind_listener()
-    return result
+    # Return the SAME shape GET does, never `update_settings`'s raw dict. Two
+    # separate bugs came out of that one line.
+    #
+    # It leaked secrets. The raw dict is the settings file, and the file holds
+    # the Telegram bot token, the locked owner's user id, the hidden-section
+    # passcode hash, the music relay session and the Mesh root secret. GET
+    # strips every one of them; the PUT was handing them all back, so changing
+    # any toggle on the Settings page put the bot token on the wire.
+    #
+    # And it reset the UI. The raw dict is missing the computed keys GET adds —
+    # `telegram_token_present`, `telegram_user_locked`, `yt_cookies_present`,
+    # `hidden_passcode_set`, `install_kind`, `platform`, `ollama_host` — and the
+    # SPA stores the reply as its whole settings object. Changing the Telegram
+    # poll interval therefore blanked `telegram_token_present`, which is what
+    # the card reads to decide the bot is configured: the stored token appeared
+    # to vanish and the relay toggle greyed itself out, on disk-perfect state.
+    return get_settings()
 
 
 # --- Hidden-section passcode (OPNMMO-0016) ----------------------------------
@@ -246,6 +262,11 @@ class PollNow(BaseModel):
     """
 
     reason: Optional[str] = None
+    # Seconds to wait for the drain this kick triggers to finish, so a caller
+    # can report what happened instead of "sent". 0 / omitted keeps the original
+    # fire-and-forget behaviour, which is what the macOS shell and the SPA's
+    # back-online handler want: neither has anyone watching a spinner.
+    wait_seconds: Optional[float] = None
 
 
 # Server-side floor on how often a kick may actually do something. Low, because
@@ -257,6 +278,11 @@ class PollNow(BaseModel):
 # stop a flood from being free.
 _POLL_NOW_MIN_INTERVAL_S = 5.0
 _last_poll_now = 0.0
+
+# Ceiling on `wait_seconds`. A cycle is a getUpdates with timeout=0 plus however
+# long the saves take, so it normally lands in under a second; 30 is generous
+# room for a slow link and a fat video, and a hard stop on holding a worker.
+_POLL_NOW_MAX_WAIT_S = 30.0
 
 
 @router.post("/telegram/poll-now")
@@ -271,9 +297,10 @@ async def poll_telegram_now(body: PollNow):
     Returns `telegram_enabled` as well, so the caller can decide whether to keep
     the app awake without a second request.
     """
+    import asyncio
     import time as _time
 
-    from backend.core.app_settings import get_settings as _get
+    from backend.core.app_settings import get_settings as _get, telegram_token_present
     from backend.services.telegram_relay import (
         RELAY_STATUS,
         hours_since_success,
@@ -285,14 +312,55 @@ async def poll_telegram_now(body: PollNow):
     enabled = bool(_get().get("telegram_enabled"))
     running = bool(RELAY_STATUS.get("running"))
     now = _time.monotonic()
-    kicked = running and (now - _last_poll_now) >= _POLL_NOW_MIN_INTERVAL_S
+
+    # Why a kick would achieve nothing, named rather than folded into a bare
+    # `kicked: false`. The Settings button has to tell the user which of these
+    # it is; "nothing happened" is the one answer that helps nobody.
+    if not running:
+        skipped = "not_running"
+    elif not telegram_token_present():
+        skipped = "no_token"
+    elif not enabled:
+        skipped = "disabled"
+    elif (now - _last_poll_now) < _POLL_NOW_MIN_INTERVAL_S:
+        skipped = "throttled"
+    else:
+        skipped = None
+
+    seq_before = int(RELAY_STATUS.get("poll_seq") or 0)
+    saved_before = int(RELAY_STATUS.get("saved_count") or 0)
+    kicked = skipped is None
     if kicked:
         _last_poll_now = now
         kick()
+
+    # Wait for the cycle to actually finish, when asked to. Polling the counter
+    # rather than awaiting an Event on purpose: an asyncio.Event binds to the
+    # loop that first touches it, and the relay's `_KICK` carries a long comment
+    # about what that cost the last time something here reached for one.
+    completed = False
+    waited = max(0.0, min(float(body.wait_seconds or 0.0), _POLL_NOW_MAX_WAIT_S))
+    if kicked and waited:
+        deadline = _time.monotonic() + waited
+        while _time.monotonic() < deadline:
+            if int(RELAY_STATUS.get("poll_seq") or 0) != seq_before:
+                completed = True
+                break
+            await asyncio.sleep(0.1)
+
     return {
         "kicked": kicked,
         "running": running,
         "telegram_enabled": enabled,
+        # None when the kick went through. Otherwise which guard stopped it.
+        "skipped_reason": skipped,
+        # Did a full cycle land inside `wait_seconds`? False without a wait, and
+        # false on a timeout — the poll may still be in flight, so the caller
+        # should say "still checking", never "nothing found".
+        "completed": completed,
+        "saved": (int(RELAY_STATUS.get("saved_count") or 0) - saved_before) if completed else 0,
+        # Set by the cycle we just waited on, so it explains THIS check.
+        "last_error": RELAY_STATUS.get("last_error") if completed else None,
         # The caller (the macOS shell, on wake) uses this to decide whether to
         # put a notification on screen. Reported before the kick has had time to
         # land, which is correct: it describes the gap being recovered from.
