@@ -484,6 +484,22 @@ export interface AppSettings {
 
 export type InstallKind = 'macos' | 'docker' | 'dev';
 
+export interface TelegramPollNow {
+  /** Did the kick reach the relay? False means `skipped_reason` says why not. */
+  kicked: boolean;
+  running: boolean;
+  telegram_enabled: boolean;
+  /** Null when kicked. Otherwise which guard stopped it. */
+  skipped_reason: 'not_running' | 'no_token' | 'disabled' | 'throttled' | null;
+  /** Did a full poll finish inside `waitSeconds`? False on a timeout too, so
+   *  the poll may still be running — never report "nothing found" on a false. */
+  completed: boolean;
+  /** Memos the waited-on poll saved. Only meaningful when `completed`. */
+  saved: number;
+  /** What went wrong in the poll we waited on, if anything. */
+  last_error: string | null;
+}
+
 export interface TelegramRelayStatus {
   running: boolean;
   /** When the relay last TRIED. */
@@ -628,14 +644,18 @@ export const settingsApi = {
     }),
   telegramStatus: () => fetchJSON<TelegramRelayStatus>('/settings/telegram/status'),
   /** Drain Telegram now instead of waiting out the poll interval. Fired when
-   *  the network comes back; the macOS shell fires it on wake and unlock. */
-  telegramPollNow: (reason: string) =>
+   *  the network comes back; the macOS shell fires it on wake and unlock.
+   *
+   *  `waitSeconds` holds the request open until that drain finishes, so the
+   *  Settings button can report what it found. Leave it off for a background
+   *  nudge with nobody watching. */
+  telegramPollNow: (reason: string, waitSeconds = 0) =>
     // The body is not payload, it is the preflight. A bodyless POST is a CORS
     // simple request, so any page the user has open could drive this endpoint
     // cross-origin and make the backend hammer Telegram with their bot token.
-    fetchJSON<{ kicked: boolean; running: boolean; telegram_enabled: boolean }>(
+    fetchJSON<TelegramPollNow>(
       '/settings/telegram/poll-now',
-      { method: 'POST', body: JSON.stringify({ reason }) },
+      { method: 'POST', body: JSON.stringify({ reason, wait_seconds: waitSeconds }) },
     ),
   // Instagram login (final-fallback session for IG pulls). Writes into the same
   // shared cookie jar. The password is never stored — used once to sign in.

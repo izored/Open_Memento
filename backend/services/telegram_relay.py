@@ -74,6 +74,12 @@ RELAY_STATUS: dict = {
     "last_success_at": None,
     "last_error": None,
     "saved_count": 0,
+    # Bumped once per completed cycle, success or failure. "Check now" waits on
+    # it: `kick()` only wakes the loop, it cannot report what the loop then
+    # found, and a button that greys out for a moment and says nothing is not a
+    # check. Watching a counter rather than awaiting an Event keeps this free of
+    # the cross-event-loop trap documented on `_KICK` below.
+    "poll_seq": 0,
 }
 
 # Set to make the loop drain now instead of waiting out its interval. Fired by
@@ -691,7 +697,12 @@ async def run_relay_loop() -> None:
             settings = get_settings()
             token = get_telegram_token()
             if not settings.get("telegram_enabled") or not token:
-                await asyncio.sleep(30)
+                # Kickable, unlike the error backoffs further down. This is an
+                # idle wait, not a penalty: turning capture on, or pasting a
+                # token, should start polling now rather than up to 30 seconds
+                # later — and "Check now" waits on a cycle that would otherwise
+                # not begin until this sleep ran out.
+                await _sleep_or_kick(30)
                 continue
 
             # Exactly one device may poll (ADR-024 §3). Telegram hands each
@@ -720,6 +731,11 @@ async def run_relay_loop() -> None:
                 RELAY_STATUS["last_poll_at"] = datetime.utcnow().isoformat()
                 activity = await _drain(client, token, settings, timeout=0)
                 RELAY_STATUS["last_error"] = None
+                # Bumped HERE, not after the active window below: the window can
+                # hold this cycle open for five minutes, and by then whoever
+                # pressed "Check now" has long since given up waiting. Everything
+                # Telegram was holding has already been drained at this point.
+                RELAY_STATUS["poll_seq"] += 1
 
                 # Back after a real absence, with something to show for it. Say
                 # so on Telegram: that is the phone the links were shared from,
@@ -765,6 +781,10 @@ async def run_relay_loop() -> None:
             # a stale "last check" on the Settings page looking healthy. Kickable
             # too, so plugging the wifi back in retries at once.
             RELAY_STATUS["last_error"] = scrub_token(str(e))[:200]
+            # A failed cycle is still a finished cycle. Without this, "Check now"
+            # sits there until it times out and reports nothing, on exactly the
+            # occasion the user most needs to be told what went wrong.
+            RELAY_STATUS["poll_seq"] += 1
             log.warning("telegram relay could not reach Telegram: %s", scrub_token(str(e)))
             # NOT kickable. This is the backoff, and anything that can interrupt
             # it can also defeat it: a page looping the poll-now endpoint would
@@ -774,5 +794,6 @@ async def run_relay_loop() -> None:
             await asyncio.sleep(60)
         except Exception as e:
             RELAY_STATUS["last_error"] = scrub_token(str(e))[:200]
+            RELAY_STATUS["poll_seq"] += 1  # see above: a failed cycle still ends
             log.error("telegram relay cycle failed: %r", e)
             await asyncio.sleep(60)  # see above: a backoff that can be skipped is not one
